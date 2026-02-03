@@ -1,0 +1,1189 @@
+/*
+ * ============================================================
+ * Billard Balltimer - Komplettversion v1.2.0
+ * ============================================================
+ * Board: ESP32-S3-N16R8
+ * 
+ * Aenderungen v1.1.0:
+ * - WiFi-Daten im Flash (NVS) gespeichert
+ * - WiFi aenderbar ueber Webseite
+ * - Setup-Modus: 3 Kugeln innerhalb 10 Sek. nach Start
+ * - Immer spielbereit (auch ohne WiFi)
+ * - WiFi Retry alle 5 Minuten im Hintergrund
+ * - WiFi-Symbol auf Display (* = online, - = offline)
+ * - Buzzer im Takt mit LED-Blinken
+ * 
+ * Hardware:
+ * - ESP32-S3-N16R8 (16MB Flash, 8MB SRAM)
+ * - 16x TCRT5000 IR-Sensoren (DO) am CD74HC4067 Multiplexer
+ * - 56 NeoPixel LEDs (1 Opfer + 55 sichtbare) an GPIO 14
+ * - LCD 2004 I2C Display an GPIO 9 (SDA) / GPIO 10 (SCL)
+ * - KY-012 aktiver Buzzer an GPIO 17
+ * - Muenztaster an GPIO 13 (gegen GND)
+ * ============================================================
+ */
+
+#include <Adafruit_NeoPixel.h>
+#include <Wire.h>
+#include <LCD_I2C.h>
+#include <WiFi.h>
+#include <WebServer.h>
+#include <HTTPClient.h>
+#include <Update.h>
+#include <Preferences.h>
+
+// ============================================================
+// FIRMWARE VERSION - Bei jedem Update hochzaehlen!
+// ============================================================
+const char* FIRMWARE_VERSION = "1.2.0";
+
+// ============================================================
+// Pin-Definitionen
+// ============================================================
+const int SIG_PIN      = 4;
+const int S0_PIN       = 5;
+const int S1_PIN       = 6;
+const int S2_PIN       = 7;
+const int S3_PIN       = 8;
+const int I2C_SDA_PIN  = 9;
+const int I2C_SCL_PIN  = 10;
+const int MUENZ_PIN    = 13;
+const int NEOPIXEL_PIN = 14;
+const int BUZZER_PIN   = 17;
+
+// ============================================================
+// Konstanten
+// ============================================================
+const int ANZAHL_LEDS         = 56;
+const int SICHTBARE_LEDS      = 55;
+const int PRELLZEIT_MS        = 100;
+const unsigned long ZEIT_PRO_MUENZE   = 60000;
+const unsigned long WARNZEIT          = 30000;
+const int LED_HELLIGKEIT      = 100;
+const int SETUP_KUGELN        = 3;       // Geheimcode: 3 Kugeln
+const unsigned long SETUP_ZEIT = 10000;  // 10 Sekunden Fenster
+const unsigned long WIFI_RETRY_INTERVALL = 300000; // 5 Minuten
+
+// ============================================================
+// Standard WiFi (wird beim ersten Start in NVS gespeichert)
+// ============================================================
+const char* DEFAULT_WIFI_SSID = "GAMEPARK_NET";
+const char* DEFAULT_WIFI_PASS = "Lukas818191";
+
+// ============================================================
+// Update Server
+// ============================================================
+const char* VERSION_URL  = "http://www.niederrhein-liga.de/firmware/version.txt";
+const char* FIRMWARE_URL = "http://www.niederrhein-liga.de/firmware/firmware.bin";
+
+// ============================================================
+// Geraete-Konfiguration (aus Flash/NVS)
+// ============================================================
+struct GeraeteConfig {
+  uint8_t  id;
+  char     name[21];
+  uint8_t  typ;            // 0 = Billard, 1 = Snooker
+  uint8_t  ipLetzte;
+  uint8_t  anzahlSensoren; // 16 oder 23
+  uint8_t  minKugeln;      // 15 oder 22
+};
+
+GeraeteConfig geraet;
+Preferences config;
+bool konfigGeladen = false;
+
+// WiFi Daten aus Flash
+char wifiSSID[33] = "";
+char wifiPass[65] = "";
+
+// ============================================================
+// Objekte
+// ============================================================
+LCD_I2C lcd(0x27, 20, 4);
+Adafruit_NeoPixel strip(ANZAHL_LEDS, NEOPIXEL_PIN, NEO_GRB + NEO_KHZ800);
+WebServer server(80);
+
+// Farben
+uint32_t FARBE_GELB;
+uint32_t FARBE_GRUEN;
+uint32_t FARBE_ROT;
+uint32_t FARBE_BLAU;
+uint32_t FARBE_AUS;
+
+// ============================================================
+// Variablen
+// ============================================================
+bool kugelStatus[23];
+int erkannteKugeln         = 0;
+unsigned long guthabenEnde     = 0;
+unsigned long gesamtGuthaben   = 0;
+unsigned long letzterMuenzZeit  = 0;
+bool letzterMuenzStatus    = HIGH;
+bool blinkStatus           = false;
+unsigned long letzteBlinkZeit   = 0;
+unsigned long letzterBuzzerZeit  = 0;
+bool buzzerAktiv           = false;
+bool wifiVerbunden         = false;
+unsigned long letzterWifiRetry  = 0;
+
+// Zustaende
+enum Zustand {
+  WARTEN_AUF_KUGELN,
+  BEREIT,
+  SPIEL_AKTIV,
+  WARNUNG
+};
+Zustand aktuellerZustand = WARTEN_AUF_KUGELN;
+Zustand letzterZustand   = WARTEN_AUF_KUGELN;
+
+// ESP-NOW Datenstrukturen (fuer spaeter)
+struct BalltimeStatus {
+  uint8_t  id;
+  uint8_t  typ;
+  uint8_t  zustand;
+  uint16_t restzeit;
+  uint8_t  kugeln;
+  uint8_t  maxKugeln;
+};
+
+struct BezahlBefehl {
+  uint8_t  zielID;
+  uint8_t  befehl;
+  uint16_t zeit;
+};
+
+// ============================================================
+// HTML SEITEN
+// ============================================================
+
+const char* otaPage = R"rawhtml(
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Balltimer</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta charset="UTF-8">
+  <style>
+    body { font-family: Arial; text-align: center; padding: 20px; background: #1a1a2e; color: white; }
+    h1 { color: #eee; } h2 { color: #0f0; }
+    .box { background: #16213e; padding: 20px; border-radius: 10px; max-width: 400px; margin: 20px auto; }
+    input[type=file] { margin: 20px 0; color: white; }
+    input[type=text], input[type=password], input[type=number] {
+      padding: 8px; border-radius: 4px; border: 1px solid #444; background: #0a0a1a; color: white; width: 200px; }
+    .btn { background: #e94560; color: white; padding: 12px 25px; border: none; border-radius: 5px;
+           font-size: 16px; cursor: pointer; margin: 5px; }
+    .btn:hover { background: #ff6b6b; }
+    .btn-green { background: #0a8; }
+    .btn-green:hover { background: #0c9; }
+    table { margin: 10px auto; text-align: left; }
+    td { padding: 4px 10px; }
+    .label { color: #888; }
+    .value { color: #0f0; }
+  </style>
+</head>
+<body>
+  <div class="box">
+    <h1>Balltimer</h1>
+    <h2>%GERAETE_NAME%</h2>
+    <table>
+      <tr><td class="label">ID:</td><td class="value">%GERAETE_ID%</td></tr>
+      <tr><td class="label">Typ:</td><td class="value">%GERAETE_TYP%</td></tr>
+      <tr><td class="label">IP:</td><td class="value">%GERAETE_IP%</td></tr>
+      <tr><td class="label">Version:</td><td class="value">%VERSION%</td></tr>
+      <tr><td class="label">WiFi:</td><td class="value">%WIFI_SSID%</td></tr>
+      <tr><td class="label">Signal:</td><td class="value">%WIFI_RSSI% dBm</td></tr>
+    </table>
+  </div>
+
+  <div class="box">
+    <h2>WiFi Einstellungen</h2>
+    <form method="POST" action="/wifi">
+      <table>
+        <tr><td class="label">SSID:</td><td><input type="text" name="ssid" value="%WIFI_SSID%"></td></tr>
+        <tr><td class="label">Passwort:</td><td><input type="password" name="pass" value="%WIFI_PASS%"></td></tr>
+      </table><br>
+      <input type="submit" class="btn btn-green" value="WiFi Speichern + Neustart">
+    </form>
+  </div>
+
+  <div class="box">
+    <h2>Firmware Upload</h2>
+    <form method="POST" action="/update" enctype="multipart/form-data">
+      <input type="file" name="update" accept=".bin"><br><br>
+      <input type="submit" class="btn" value="Update starten">
+    </form>
+  </div>
+
+  <div class="box">
+    <h2>Geraete-ID</h2>
+    <form method="POST" action="/config">
+      <table>
+        <tr><td class="label">ID (1-5):</td><td><input type="number" name="id" min="1" max="5" value="%GERAETE_ID%" style="width:60px"></td></tr>
+      </table><br>
+      <input type="submit" class="btn" value="ID Speichern + Neustart">
+    </form>
+  </div>
+</body>
+</html>
+)rawhtml";
+
+const char* setupPage = R"rawhtml(
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Balltimer Setup</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta charset="UTF-8">
+  <style>
+    body { font-family: Arial; text-align: center; padding: 20px; background: #1a1a2e; color: white; }
+    .box { background: #16213e; padding: 30px; border-radius: 10px; max-width: 450px; margin: 20px auto; }
+    h1 { color: #e94560; } h2 { color: #0f0; }
+    input[type=text], input[type=password] {
+      padding: 8px; border-radius: 4px; border: 1px solid #444; background: #0a0a1a; color: white; width: 200px; }
+    .device { display: block; margin: 10px auto; padding: 15px; width: 80%; border: 2px solid #333;
+              border-radius: 8px; background: #0a0a1a; color: white; font-size: 18px;
+              cursor: pointer; text-decoration: none; }
+    .device:hover { border-color: #e94560; background: #1a1a3e; }
+    .billard { border-left: 4px solid #0f0; }
+    .snooker { border-left: 4px solid #ff0; }
+    .btn { background: #e94560; color: white; padding: 12px 25px; border: none; border-radius: 5px;
+           font-size: 16px; cursor: pointer; }
+    .btn:hover { background: #ff6b6b; }
+    table { margin: 10px auto; text-align: left; }
+    td { padding: 6px 10px; }
+    .label { color: #888; }
+  </style>
+</head>
+<body>
+  <div class="box">
+    <h1>Balltimer Setup</h1>
+    <h2>WiFi Konfiguration</h2>
+    <form method="POST" action="/setup_save">
+      <table>
+        <tr><td class="label">SSID:</td><td><input type="text" name="ssid" value="%WIFI_SSID%"></td></tr>
+        <tr><td class="label">Passwort:</td><td><input type="password" name="pass" value="%WIFI_PASS%"></td></tr>
+      </table>
+      <br>
+      <h2>Geraet waehlen</h2>
+      <table>
+        <tr><td><input type="radio" name="id" value="1" checked> Billard 1 (16 Kugeln)</td></tr>
+        <tr><td><input type="radio" name="id" value="2"> Billard 2 (16 Kugeln)</td></tr>
+        <tr><td><input type="radio" name="id" value="3"> Billard 3 (16 Kugeln)</td></tr>
+        <tr><td><input type="radio" name="id" value="4"> Snooker 1 (23 Kugeln)</td></tr>
+        <tr><td><input type="radio" name="id" value="5"> Snooker 2 (23 Kugeln)</td></tr>
+      </table>
+      <br>
+      <input type="submit" class="btn" value="Speichern + Neustart">
+    </form>
+  </div>
+</body>
+</html>
+)rawhtml";
+
+// ============================================================
+// GERAETE-KONFIGURATION
+// ============================================================
+
+void ladeStandardConfig(uint8_t id) {
+  geraet.id = id;
+  switch (id) {
+    case 1: strcpy(geraet.name, "Billard 1"); geraet.typ=0; geraet.ipLetzte=10; geraet.anzahlSensoren=16; geraet.minKugeln=15; break;
+    case 2: strcpy(geraet.name, "Billard 2"); geraet.typ=0; geraet.ipLetzte=11; geraet.anzahlSensoren=16; geraet.minKugeln=15; break;
+    case 3: strcpy(geraet.name, "Billard 3"); geraet.typ=0; geraet.ipLetzte=12; geraet.anzahlSensoren=16; geraet.minKugeln=15; break;
+    case 4: strcpy(geraet.name, "Snooker 1"); geraet.typ=1; geraet.ipLetzte=13; geraet.anzahlSensoren=23; geraet.minKugeln=22; break;
+    case 5: strcpy(geraet.name, "Snooker 2"); geraet.typ=1; geraet.ipLetzte=14; geraet.anzahlSensoren=23; geraet.minKugeln=22; break;
+    default: strcpy(geraet.name, "Unbekannt"); geraet.typ=0; geraet.ipLetzte=50; geraet.anzahlSensoren=16; geraet.minKugeln=15; break;
+  }
+}
+
+void speichereID(uint8_t id) {
+  config.begin("balltimer", false);
+  config.putUChar("id", id);
+  config.end();
+  Serial.printf("ID %d gespeichert!\n", id);
+}
+
+void speichereWiFi(const char* ssid, const char* pass) {
+  config.begin("balltimer", false);
+  config.putString("ssid", ssid);
+  config.putString("pass", pass);
+  config.end();
+  Serial.printf("WiFi gespeichert: %s\n", ssid);
+}
+
+void ladeWiFi() {
+  config.begin("balltimer", true);
+  String ssid = config.getString("ssid", "");
+  String pass = config.getString("pass", "");
+  config.end();
+  
+  if (ssid.length() > 0) {
+    strncpy(wifiSSID, ssid.c_str(), 32);
+    strncpy(wifiPass, pass.c_str(), 64);
+    Serial.printf("WiFi aus Flash: %s\n", wifiSSID);
+  } else {
+    // Erste Nutzung: Standard-Werte speichern
+    strncpy(wifiSSID, DEFAULT_WIFI_SSID, 32);
+    strncpy(wifiPass, DEFAULT_WIFI_PASS, 64);
+    speichereWiFi(wifiSSID, wifiPass);
+    Serial.printf("WiFi Standard gespeichert: %s\n", wifiSSID);
+  }
+}
+
+bool ladeConfig() {
+  config.begin("balltimer", true);
+  uint8_t id = config.getUChar("id", 0);
+  config.end();
+  
+  if (id >= 1 && id <= 5) {
+    ladeStandardConfig(id);
+    Serial.println("================================");
+    Serial.printf("Geraet: %s (ID %d)\n", geraet.name, geraet.id);
+    Serial.printf("Typ: %s\n", geraet.typ == 0 ? "Billard" : "Snooker");
+    Serial.printf("IP: 192.168.1.%d\n", geraet.ipLetzte);
+    Serial.printf("Sensoren: %d / Min: %d\n", geraet.anzahlSensoren, geraet.minKugeln);
+    Serial.println("================================");
+    return true;
+  }
+  Serial.println("KEINE GERAETE-ID GEFUNDEN!");
+  return false;
+}
+
+// ============================================================
+// MULTIPLEXER & SENSOREN
+// ============================================================
+
+void waehlKanal(int kanal) {
+  digitalWrite(S0_PIN, kanal & 0x01);
+  digitalWrite(S1_PIN, (kanal >> 1) & 0x01);
+  digitalWrite(S2_PIN, (kanal >> 2) & 0x01);
+  digitalWrite(S3_PIN, (kanal >> 3) & 0x01);
+  delayMicroseconds(50);
+}
+
+bool leseKanal(int kanal) {
+  waehlKanal(kanal);
+  int lowCount = 0;
+  for (int i = 0; i < 5; i++) {
+    if (digitalRead(SIG_PIN) == LOW) lowCount++;
+    delayMicroseconds(100);
+  }
+  return (lowCount >= 3);
+}
+
+void leseSensoren() {
+  erkannteKugeln = 0;
+  for (int i = 0; i < geraet.anzahlSensoren; i++) {
+    kugelStatus[i] = leseKanal(i);
+    if (kugelStatus[i]) erkannteKugeln++;
+  }
+}
+
+// Spezielle Version fuer Setup-Pruefung (liest immer 16 Kanaele)
+int leseSensorenBoot() {
+  int kugeln = 0;
+  for (int i = 0; i < 16; i++) {
+    if (leseKanal(i)) kugeln++;
+  }
+  return kugeln;
+}
+
+bool alleKugelnDa() {
+  return (erkannteKugeln >= geraet.minKugeln);
+}
+
+// ============================================================
+// SETUP-MODUS PRUEFUNG (3 Kugeln = Setup)
+// ============================================================
+
+bool pruefeSetupModus() {
+  Serial.println("--- Setup-Pruefung (10 Sekunden) ---");
+  Serial.println("3 Kugeln einlegen fuer Setup-Modus");
+  
+  lcd.setCursor(0, 0);
+  lcd.print("  Setup Pruefung    ");
+  lcd.setCursor(0, 1);
+  lcd.print(" 3 Kugeln = Setup   ");
+  
+  unsigned long startZeit = millis();
+  
+  while (millis() - startZeit < SETUP_ZEIT) {
+    int restSekunden = (SETUP_ZEIT - (millis() - startZeit)) / 1000;
+    int kugeln = leseSensorenBoot();
+    
+    lcd.setCursor(0, 2);
+    lcd.print("  Kugeln: ");
+    lcd.print(kugeln);
+    lcd.print("         ");
+    
+    lcd.setCursor(0, 3);
+    lcd.print("  Noch ");
+    if (restSekunden < 10) lcd.print(" ");
+    lcd.print(restSekunden);
+    lcd.print(" Sekunden    ");
+    
+    Serial.printf("Kugeln: %d | Noch %d Sek.\n", kugeln, restSekunden);
+    
+    if (kugeln == SETUP_KUGELN) {
+      Serial.println(">>> 3 KUGELN ERKANNT - SETUP MODUS!");
+      
+      lcd.setCursor(0, 0);
+      lcd.print(">>> SETUP MODUS <<< ");
+      lcd.setCursor(0, 1);
+      lcd.print("  3 Kugeln erkannt! ");
+      lcd.setCursor(0, 2);
+      lcd.print("                    ");
+      lcd.setCursor(0, 3);
+      lcd.print("  Starte Setup...   ");
+      delay(2000);
+      return true;
+    }
+    
+    delay(200);
+  }
+  
+  Serial.println("Kein Setup - Normaler Start");
+  return false;
+}
+
+// ============================================================
+// KONFIGURATIONS-PORTAL (Access Point)
+// ============================================================
+
+void starteKonfigPortal() {
+  Serial.println("Starte Konfigurations-Portal...");
+  
+  // Blau blinken = Setup
+  for (int i = 0; i < ANZAHL_LEDS; i++) {
+    strip.setPixelColor(i, FARBE_BLAU);
+  }
+  strip.show();
+  
+  // AP Name mit Geraete-Info
+  String apName = "Balltimer_Setup";
+  if (konfigGeladen) {
+    apName = "Balltimer_" + String(geraet.id) + "_Setup";
+  }
+  
+  WiFi.softAP(apName.c_str(), "12345678");
+  Serial.printf("AP: %s | IP: ", apName.c_str());
+  Serial.println(WiFi.softAPIP());
+  
+  lcd.setCursor(0, 0);
+  lcd.print("=== SETUP MODUS === ");
+  lcd.setCursor(0, 1);
+  lcd.print("WLAN:");
+  lcd.print(apName.substring(0, 15));
+  for (int i = apName.length() + 5; i < 20; i++) lcd.print(" ");
+  lcd.setCursor(0, 2);
+  lcd.print("Pass: 12345678      ");
+  lcd.setCursor(0, 3);
+  lcd.print("IP: 192.168.4.1     ");
+  
+  WebServer setupServer(80);
+  
+  // Hauptseite
+  setupServer.on("/", HTTP_GET, [&setupServer]() {
+    String html = setupPage;
+    html.replace("%WIFI_SSID%", String(wifiSSID));
+    html.replace("%WIFI_PASS%", String(wifiPass));
+    setupServer.send(200, "text/html", html);
+  });
+  
+  // Speichern
+  setupServer.on("/setup_save", HTTP_POST, [&setupServer]() {
+    String ssid = setupServer.arg("ssid");
+    String pass = setupServer.arg("pass");
+    uint8_t id  = setupServer.arg("id").toInt();
+    
+    if (ssid.length() > 0 && id >= 1 && id <= 5) {
+      speichereWiFi(ssid.c_str(), pass.c_str());
+      speichereID(id);
+      ladeStandardConfig(id);
+      
+      String html = "<html><head><meta charset='UTF-8'>";
+      html += "<style>body{font-family:Arial;text-align:center;padding:40px;background:#1a1a2e;color:white;}";
+      html += ".ok{color:#0f0;font-size:48px;}</style></head><body>";
+      html += "<p class='ok'>&#10004;</p>";
+      html += "<h1>" + String(geraet.name) + "</h1>";
+      html += "<p>WiFi: " + ssid + "</p>";
+      html += "<p>Neustart in 3 Sekunden...</p>";
+      html += "</body></html>";
+      
+      setupServer.send(200, "text/html", html);
+      
+      lcd.setCursor(0, 0);
+      lcd.print("  Gespeichert!      ");
+      lcd.setCursor(0, 2);
+      lcd.print("  ");
+      lcd.print(geraet.name);
+      for (int i = String(geraet.name).length() + 2; i < 20; i++) lcd.print(" ");
+      lcd.setCursor(0, 3);
+      lcd.print("   Neustart...      ");
+      
+      delay(3000);
+      ESP.restart();
+    } else {
+      setupServer.send(400, "text/plain", "Ungueltige Eingabe!");
+    }
+  });
+  
+  setupServer.begin();
+  
+  // Endlosschleife
+  unsigned long letztesBlinken = 0;
+  bool blau = true;
+  
+  while (true) {
+    setupServer.handleClient();
+    if (millis() - letztesBlinken >= 1000) {
+      letztesBlinken = millis();
+      blau = !blau;
+      for (int i = 0; i < ANZAHL_LEDS; i++) {
+        strip.setPixelColor(i, blau ? FARBE_BLAU : FARBE_AUS);
+      }
+      strip.show();
+    }
+    delay(10);
+  }
+}
+
+// ============================================================
+// WIFI VERBINDUNG
+// ============================================================
+
+bool wifiVerbinden() {
+  IPAddress ip(192, 168, 1, geraet.ipLetzte);
+  IPAddress gateway(192, 168, 1, 1);
+  IPAddress subnet(255, 255, 255, 0);
+  
+  Serial.printf("WiFi: %s -> 192.168.1.%d\n", wifiSSID, geraet.ipLetzte);
+  
+  WiFi.mode(WIFI_STA);
+  WiFi.config(ip, gateway, subnet);
+  WiFi.begin(wifiSSID, wifiPass);
+  
+  lcd.setCursor(0, 2);
+  lcd.print("  WiFi verbinden... ");
+  
+  int versuche = 0;
+  while (WiFi.status() != WL_CONNECTED && versuche < 20) {
+    delay(500);
+    Serial.print(".");
+    versuche++;
+  }
+  Serial.println();
+  
+  if (WiFi.status() == WL_CONNECTED) {
+    wifiVerbunden = true;
+    Serial.println("=== WiFi VERBUNDEN ===");
+    Serial.printf("IP:   %s\n", WiFi.localIP().toString().c_str());
+    Serial.printf("RSSI: %d dBm\n", WiFi.RSSI());
+    
+    lcd.setCursor(0, 2);
+    lcd.print("  WiFi verbunden    ");
+    lcd.setCursor(0, 3);
+    lcd.print("  ");
+    lcd.print(WiFi.localIP().toString());
+    int len = WiFi.localIP().toString().length() + 2;
+    for (int i = len; i < 20; i++) lcd.print(" ");
+    delay(2000);
+    return true;
+  } else {
+    wifiVerbunden = false;
+    Serial.printf("WiFi FEHLER (Status: %d)\n", WiFi.status());
+    
+    lcd.setCursor(0, 2);
+    lcd.print("  Kein WiFi         ");
+    lcd.setCursor(0, 3);
+    lcd.print("  Spiel bereit!     ");
+    delay(2000);
+    return false;
+  }
+}
+
+void wifiRetry() {
+  unsigned long jetzt = millis();
+  
+  if (wifiVerbunden) {
+    // Verbindung verloren?
+    if (WiFi.status() != WL_CONNECTED) {
+      wifiVerbunden = false;
+      Serial.println("WiFi Verbindung verloren!");
+      letzterWifiRetry = jetzt;
+    }
+    return;
+  }
+  
+  // Alle 5 Minuten erneut versuchen
+  if (jetzt - letzterWifiRetry >= WIFI_RETRY_INTERVALL) {
+    letzterWifiRetry = jetzt;
+    Serial.println("WiFi Retry...");
+    
+    WiFi.begin(wifiSSID, wifiPass);
+    
+    int versuche = 0;
+    while (WiFi.status() != WL_CONNECTED && versuche < 10) {
+      delay(500);
+      versuche++;
+    }
+    
+    if (WiFi.status() == WL_CONNECTED) {
+      wifiVerbunden = true;
+      Serial.printf("WiFi wieder verbunden! IP: %s\n", WiFi.localIP().toString().c_str());
+      
+      // OTA Server starten falls noch nicht aktiv
+      otaSetup();
+    } else {
+      Serial.println("WiFi Retry fehlgeschlagen");
+    }
+  }
+}
+
+// ============================================================
+// AUTO-UPDATE
+// ============================================================
+
+void pruefeUpdate() {
+  Serial.println("Pruefe Firmware Update...");
+  
+  lcd.setCursor(0, 2);
+  lcd.print("  Pruefe Update...  ");
+  lcd.setCursor(0, 3);
+  lcd.print("                    ");
+  
+  HTTPClient http;
+  http.begin(VERSION_URL);
+  http.setTimeout(5000);
+  int httpCode = http.GET();
+  
+  if (httpCode == 200) {
+    String neueVersion = http.getString();
+    neueVersion.trim();
+    
+    Serial.printf("Lokal: %s | Server: %s\n", FIRMWARE_VERSION, neueVersion.c_str());
+    
+    if (neueVersion != String(FIRMWARE_VERSION)) {
+      Serial.println(">>> NEUE VERSION!");
+      lcd.setCursor(0, 2);
+      lcd.print("  Neue Version!     ");
+      lcd.setCursor(0, 3);
+      lcd.print("  v");
+      lcd.print(neueVersion);
+      int len = neueVersion.length() + 3;
+      for (int i = len; i < 20; i++) lcd.print(" ");
+      delay(2000);
+      
+      firmwareUpdate();
+    } else {
+      Serial.println("Firmware aktuell.");
+      lcd.setCursor(0, 2);
+      lcd.print("  Firmware aktuell  ");
+      lcd.setCursor(0, 3);
+      lcd.print("  v");
+      lcd.print(FIRMWARE_VERSION);
+      int len = String(FIRMWARE_VERSION).length() + 3;
+      for (int i = len; i < 20; i++) lcd.print(" ");
+      delay(2000);
+    }
+  } else {
+    Serial.printf("Server nicht erreichbar (%d)\n", httpCode);
+    lcd.setCursor(0, 2);
+    lcd.print("  Server offline    ");
+    delay(2000);
+  }
+  http.end();
+}
+
+void firmwareUpdate() {
+  lcd.setCursor(0, 2);
+  lcd.print("  Lade Update...    ");
+  
+  HTTPClient http;
+  http.begin(FIRMWARE_URL);
+  http.setTimeout(15000);
+  int httpCode = http.GET();
+  
+  if (httpCode == 200) {
+    int contentLength = http.getSize();
+    WiFiClient* stream = http.getStreamPtr();
+    
+    if (contentLength > 0 && Update.begin(contentLength)) {
+      size_t written = 0;
+      uint8_t buf[1024];
+      
+      while (http.connected() && written < (size_t)contentLength) {
+        size_t available = stream->available();
+        if (available) {
+          int readBytes = stream->readBytes(buf, min(available, sizeof(buf)));
+          Update.write(buf, readBytes);
+          written += readBytes;
+          
+          int prozent = (written * 100) / contentLength;
+          lcd.setCursor(0, 3);
+          lcd.print("   ");
+          if (prozent < 10) lcd.print(" ");
+          if (prozent < 100) lcd.print(" ");
+          lcd.print(prozent);
+          lcd.print("% [");
+          int balken = prozent / 10;
+          for (int i = 0; i < 10; i++) lcd.print(i < balken ? "#" : "-");
+          lcd.print("]  ");
+          
+          int leds = (written * SICHTBARE_LEDS) / contentLength;
+          strip.setPixelColor(0, FARBE_AUS);
+          for (int i = 1; i <= SICHTBARE_LEDS; i++)
+            strip.setPixelColor(i, i <= leds ? FARBE_BLAU : FARBE_AUS);
+          strip.show();
+        }
+        delay(1);
+      }
+      
+      if (Update.end(true)) {
+        Serial.printf("Update OK! %u Bytes\n", written);
+        lcd.setCursor(0, 2); lcd.print("  Update OK!        ");
+        lcd.setCursor(0, 3); lcd.print("    Neustart...     ");
+        for (int i = 0; i < ANZAHL_LEDS; i++) strip.setPixelColor(i, FARBE_GRUEN);
+        strip.show();
+        delay(3000);
+        ESP.restart();
+      } else {
+        Update.printError(Serial);
+        lcd.setCursor(0, 2); lcd.print("  Update FEHLER!    ");
+        delay(3000);
+      }
+    }
+  } else {
+    Serial.printf("Download Fehler (%d)\n", httpCode);
+    lcd.setCursor(0, 2); lcd.print("  Download Fehler!  ");
+    delay(3000);
+  }
+  http.end();
+}
+
+// ============================================================
+// WEB-OTA SERVER
+// ============================================================
+
+void otaSetup() {
+  // Hauptseite
+  server.on("/", HTTP_GET, []() {
+    String html = otaPage;
+    html.replace("%GERAETE_NAME%", geraet.name);
+    html.replace("%GERAETE_ID%", String(geraet.id));
+    html.replace("%GERAETE_TYP%", geraet.typ == 0 ? "Billard" : "Snooker");
+    html.replace("%GERAETE_IP%", WiFi.localIP().toString());
+    html.replace("%VERSION%", FIRMWARE_VERSION);
+    html.replace("%WIFI_SSID%", String(wifiSSID));
+    html.replace("%WIFI_PASS%", String(wifiPass));
+    html.replace("%WIFI_RSSI%", String(WiFi.RSSI()));
+    server.send(200, "text/html", html);
+  });
+  
+  // WiFi aendern
+  server.on("/wifi", HTTP_POST, []() {
+    String ssid = server.arg("ssid");
+    String pass = server.arg("pass");
+    if (ssid.length() > 0) {
+      speichereWiFi(ssid.c_str(), pass.c_str());
+      server.send(200, "text/plain", "WiFi gespeichert! Neustart...");
+      delay(2000);
+      ESP.restart();
+    }
+    server.send(400, "text/plain", "SSID fehlt!");
+  });
+  
+  // Firmware Upload
+  server.on("/update", HTTP_POST, []() {
+    server.sendHeader("Connection", "close");
+    server.send(200, "text/plain", Update.hasError() ? "Update FEHLER!" : "Update OK! Neustart...");
+    delay(3000);
+    ESP.restart();
+  }, []() {
+    HTTPUpload& upload = server.upload();
+    if (upload.status == UPLOAD_FILE_START) {
+      Serial.printf("OTA: %s\n", upload.filename.c_str());
+      lcd.setCursor(0, 2); lcd.print("  OTA Upload...     ");
+      Update.begin(UPDATE_SIZE_UNKNOWN);
+    } else if (upload.status == UPLOAD_FILE_WRITE) {
+      Update.write(upload.buf, upload.currentSize);
+    } else if (upload.status == UPLOAD_FILE_END) {
+      if (Update.end(true)) {
+        Serial.printf("OTA OK: %u Bytes\n", upload.totalSize);
+        lcd.setCursor(0, 2); lcd.print("  OTA Update OK!    ");
+      } else {
+        Update.printError(Serial);
+      }
+    }
+  });
+  
+  // ID aendern
+  server.on("/config", HTTP_POST, []() {
+    if (server.hasArg("id")) {
+      uint8_t id = server.arg("id").toInt();
+      if (id >= 1 && id <= 5) {
+        speichereID(id);
+        server.send(200, "text/plain", "ID gespeichert! Neustart...");
+        delay(2000);
+        ESP.restart();
+      }
+    }
+    server.send(400, "text/plain", "Ungueltige ID!");
+  });
+  
+  // Status JSON
+  server.on("/status", HTTP_GET, []() {
+    unsigned long jetzt = millis();
+    unsigned long restzeit = (guthabenEnde > jetzt) ? (guthabenEnde - jetzt) / 1000 : 0;
+    
+    String json = "{";
+    json += "\"id\":" + String(geraet.id);
+    json += ",\"name\":\"" + String(geraet.name) + "\"";
+    json += ",\"typ\":\"" + String(geraet.typ == 0 ? "Billard" : "Snooker") + "\"";
+    json += ",\"version\":\"" + String(FIRMWARE_VERSION) + "\"";
+    json += ",\"zustand\":" + String(aktuellerZustand);
+    json += ",\"restzeit\":" + String(restzeit);
+    json += ",\"kugeln\":" + String(erkannteKugeln);
+    json += ",\"maxKugeln\":" + String(geraet.anzahlSensoren);
+    json += ",\"wifi\":\"" + String(wifiSSID) + "\"";
+    json += ",\"rssi\":" + String(WiFi.RSSI());
+    json += ",\"ip\":\"" + WiFi.localIP().toString() + "\"";
+    json += "}";
+    
+    server.send(200, "application/json", json);
+  });
+  
+  server.begin();
+  Serial.println("Webserver gestartet");
+}
+
+// ============================================================
+// LED FUNKTIONEN
+// ============================================================
+
+void setzeFarbe(uint32_t farbe) {
+  strip.setPixelColor(0, FARBE_AUS);
+  for (int i = 1; i < ANZAHL_LEDS; i++) strip.setPixelColor(i, farbe);
+  strip.show();
+}
+
+void blinkeFarbe(uint32_t farbe, int intervall) {
+  unsigned long jetzt = millis();
+  if (jetzt - letzteBlinkZeit >= (unsigned long)intervall) {
+    letzteBlinkZeit = jetzt;
+    blinkStatus = !blinkStatus;
+    strip.setPixelColor(0, FARBE_AUS);
+    for (int i = 1; i < ANZAHL_LEDS; i++)
+      strip.setPixelColor(i, blinkStatus ? farbe : FARBE_AUS);
+    strip.show();
+  }
+}
+
+void zeigeZeitbalken() {
+  unsigned long jetzt = millis();
+  unsigned long restzeit = (guthabenEnde > jetzt) ? guthabenEnde - jetzt : 0;
+  
+  int grueneLeds = 0;
+  if (gesamtGuthaben > 0 && restzeit > 0) {
+    grueneLeds = (restzeit * SICHTBARE_LEDS) / gesamtGuthaben;
+    if (grueneLeds > SICHTBARE_LEDS) grueneLeds = SICHTBARE_LEDS;
+  }
+  
+  strip.setPixelColor(0, FARBE_AUS);
+  for (int i = 1; i <= SICHTBARE_LEDS; i++)
+    strip.setPixelColor(i, (i <= grueneLeds) ? FARBE_GRUEN : FARBE_ROT);
+  strip.show();
+}
+
+void zeigeZeitbalkenBlinkend() {
+  unsigned long jetzt = millis();
+  if (jetzt - letzteBlinkZeit >= 500) {
+    letzteBlinkZeit = jetzt;
+    blinkStatus = !blinkStatus;
+  }
+  if (blinkStatus) {
+    zeigeZeitbalken();
+  } else {
+    strip.setPixelColor(0, FARBE_AUS);
+    for (int i = 1; i < ANZAHL_LEDS; i++) strip.setPixelColor(i, FARBE_AUS);
+    strip.show();
+  }
+}
+
+void aktualisiereLEDs() {
+  switch (aktuellerZustand) {
+    case WARTEN_AUF_KUGELN: blinkeFarbe(FARBE_ROT, 500); break;
+    case BEREIT:            setzeFarbe(FARBE_GELB); break;
+    case SPIEL_AKTIV:       zeigeZeitbalken(); break;
+    case WARNUNG:           zeigeZeitbalkenBlinkend(); break;
+  }
+}
+
+// ============================================================
+// BUZZER
+// ============================================================
+
+void aktualisiereBuzzer() {
+  unsigned long jetzt = millis();
+  switch (aktuellerZustand) {
+    case WARNUNG:
+      if (jetzt - letzterBuzzerZeit >= 5000) {
+        letzterBuzzerZeit = jetzt;
+        digitalWrite(BUZZER_PIN, HIGH);
+        buzzerAktiv = true;
+      }
+      if (buzzerAktiv && jetzt - letzterBuzzerZeit >= 300) {
+        digitalWrite(BUZZER_PIN, LOW);
+        buzzerAktiv = false;
+      }
+      break;
+    case WARTEN_AUF_KUGELN:
+      digitalWrite(BUZZER_PIN, blinkStatus ? HIGH : LOW);
+      break;
+    case BEREIT:
+    case SPIEL_AKTIV:
+      digitalWrite(BUZZER_PIN, LOW);
+      buzzerAktiv = false;
+      break;
+  }
+}
+
+// ============================================================
+// MUENZPRUEFER
+// ============================================================
+
+void pruefeMuenzeinwurf() {
+  bool muenzStatus = digitalRead(MUENZ_PIN);
+  unsigned long jetzt = millis();
+  
+  if (letzterMuenzStatus == HIGH && muenzStatus == LOW) {
+    if (jetzt - letzterMuenzZeit > PRELLZEIT_MS) {
+      letzterMuenzZeit = jetzt;
+      
+      if (alleKugelnDa()) {
+        if (guthabenEnde < jetzt) {
+          guthabenEnde = jetzt + ZEIT_PRO_MUENZE;
+          gesamtGuthaben = ZEIT_PRO_MUENZE;
+        } else {
+          guthabenEnde += ZEIT_PRO_MUENZE;
+          gesamtGuthaben += ZEIT_PRO_MUENZE;
+        }
+        digitalWrite(BUZZER_PIN, LOW);
+        buzzerAktiv = false;
+        
+        unsigned long restzeit = (guthabenEnde - jetzt) / 1000;
+        Serial.printf(">>> MUENZE! Guthaben: %lu Sek.\n", restzeit);
+      } else {
+        Serial.println(">>> Muenze ABGELEHNT!");
+      }
+    }
+  }
+  letzterMuenzStatus = muenzStatus;
+}
+
+// ============================================================
+// DISPLAY
+// ============================================================
+
+void aktualisiereDisplay() {
+  unsigned long jetzt = millis();
+  static unsigned long letzteDisplayUpdate = 0;
+  if (jetzt - letzteDisplayUpdate < 250) return;
+  letzteDisplayUpdate = jetzt;
+  
+  switch (aktuellerZustand) {
+    case WARTEN_AUF_KUGELN:
+      lcd.setCursor(0, 2); lcd.print("  Token  Einwerfen  ");
+      lcd.setCursor(0, 3); lcd.print("     Game Over      ");
+      break;
+    case BEREIT:
+      lcd.setCursor(0, 2); lcd.print("  Token  Einwerfen  ");
+      lcd.setCursor(0, 3); lcd.print("      Bereit        ");
+      break;
+    case SPIEL_AKTIV:
+    case WARNUNG: {
+      lcd.setCursor(0, 2); lcd.print(" Verbleibende Zeit  ");
+      unsigned long restzeit = (guthabenEnde > jetzt) ? (guthabenEnde - jetzt) / 1000 : 0;
+      int minuten = restzeit / 60;
+      int sekunden = restzeit % 60;
+      lcd.setCursor(0, 3);
+      lcd.print("       ");
+      if (minuten < 10) lcd.print("0");
+      lcd.print(minuten); lcd.print(":");
+      if (sekunden < 10) lcd.print("0");
+      lcd.print(sekunden);
+      lcd.print("        ");
+      break;
+    }
+  }
+}
+
+void aktualisiereWiFiSymbol() {
+  static unsigned long letztesPruefen = 0;
+  if (millis() - letztesPruefen < 3000) return;
+  letztesPruefen = millis();
+  
+  wifiVerbunden = (WiFi.status() == WL_CONNECTED);
+  lcd.setCursor(19, 0);
+  lcd.print(wifiVerbunden ? "*" : "-");
+}
+
+// ============================================================
+// ZUSTANDSMASCHINE
+// ============================================================
+
+void aktualisiereZustand() {
+  unsigned long jetzt = millis();
+  bool kugelnKomplett = alleKugelnDa();
+  bool hatGuthaben = (guthabenEnde > jetzt);
+  unsigned long restzeit = hatGuthaben ? (guthabenEnde - jetzt) : 0;
+  
+  Zustand neuerZustand;
+  
+  if (!kugelnKomplett && !hatGuthaben)       neuerZustand = WARTEN_AUF_KUGELN;
+  else if (kugelnKomplett && !hatGuthaben)   neuerZustand = BEREIT;
+  else if (hatGuthaben && restzeit <= WARNZEIT) neuerZustand = WARNUNG;
+  else if (hatGuthaben)                      neuerZustand = SPIEL_AKTIV;
+  else                                       neuerZustand = BEREIT;
+  
+  if (!hatGuthaben) gesamtGuthaben = 0;
+  
+  if (neuerZustand != aktuellerZustand) {
+    letzterZustand = aktuellerZustand;
+    aktuellerZustand = neuerZustand;
+    letzterBuzzerZeit = jetzt;
+    
+    const char* statusTexte[] = {"WARTEN AUF KUGELN", "BEREIT", "SPIEL AKTIV", "WARNUNG"};
+    Serial.printf("Status: %s\n", statusTexte[aktuellerZustand]);
+    
+    if (aktuellerZustand == BEREIT) digitalWrite(BUZZER_PIN, LOW);
+  }
+}
+
+// ============================================================
+// SERIAL STATUS
+// ============================================================
+
+void zeigeStatus() {
+  static unsigned long letzteAusgabe = 0;
+  if (millis() - letzteAusgabe < 2000) return;
+  letzteAusgabe = millis();
+  
+  Serial.printf("[%s] ", geraet.name);
+  for (int i = 0; i < geraet.anzahlSensoren; i++)
+    Serial.print(kugelStatus[i] ? "+" : "o");
+  Serial.printf(" | %d/%d", erkannteKugeln, geraet.anzahlSensoren);
+  if (alleKugelnDa()) Serial.print(" [VOLL]");
+  if (guthabenEnde > millis())
+    Serial.printf(" | Zeit: %lus", (guthabenEnde - millis()) / 1000);
+  Serial.println();
+}
+
+// ============================================================
+// SETUP
+// ============================================================
+
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+  
+  Serial.println("========================================");
+  Serial.printf("  Billard Balltimer v%s\n", FIRMWARE_VERSION);
+  Serial.println("========================================");
+  
+  // Hardware init
+  pinMode(S0_PIN, OUTPUT);
+  pinMode(S1_PIN, OUTPUT);
+  pinMode(S2_PIN, OUTPUT);
+  pinMode(S3_PIN, OUTPUT);
+  pinMode(SIG_PIN, INPUT);
+  pinMode(MUENZ_PIN, INPUT_PULLUP);
+  pinMode(BUZZER_PIN, OUTPUT);
+  digitalWrite(BUZZER_PIN, LOW);
+  
+  // Display
+  Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
+  lcd.begin();
+  lcd.backlight();
+  
+  // NeoPixel
+  strip.begin();
+  strip.setBrightness(LED_HELLIGKEIT);
+  strip.show();
+  FARBE_GELB  = strip.Color(255, 180, 0);
+  FARBE_GRUEN = strip.Color(0, 255, 0);
+  FARBE_ROT   = strip.Color(255, 0, 0);
+  FARBE_BLAU  = strip.Color(0, 0, 255);
+  FARBE_AUS   = strip.Color(0, 0, 0);
+  
+  // --- Konfiguration laden ---
+  konfigGeladen = ladeConfig();
+  ladeWiFi();
+  
+  // --- Setup-Modus pruefen (3 Kugeln in 10 Sek.) ---
+  if (pruefeSetupModus()) {
+    starteKonfigPortal();
+    // Kommt hier nie an
+  }
+  
+  // --- Keine ID? Auch Setup starten ---
+  if (!konfigGeladen) {
+    starteKonfigPortal();
+  }
+  
+  // --- Startanzeige ---
+  lcd.setCursor(0, 0);
+  String zeile1 = "    " + String(geraet.name);
+  lcd.print(zeile1.substring(0, 19));
+  int len1 = min((int)zeile1.length(), 19);
+  for (int i = len1; i < 19; i++) lcd.print(" ");
+  lcd.print("-");  // WiFi Symbol erstmal offline
+  
+  lcd.setCursor(0, 1);
+  lcd.print("   GAME PARK 38     ");
+  
+  // --- WiFi verbinden ---
+  if (wifiVerbinden()) {
+    pruefeUpdate();
+    otaSetup();
+  }
+  
+  // --- Display zuruecksetzen ---
+  lcd.setCursor(0, 0);
+  lcd.print(zeile1.substring(0, 19));
+  for (int i = len1; i < 19; i++) lcd.print(" ");
+  lcd.print(wifiVerbunden ? "*" : "-");
+  lcd.setCursor(0, 1);
+  lcd.print("   GAME PARK 38     ");
+  
+  Serial.println("System bereit!");
+  if (wifiVerbunden) {
+    Serial.printf("Web: http://192.168.1.%d\n", geraet.ipLetzte);
+  }
+  Serial.println("========================================");
+}
+
+// ============================================================
+// MAIN LOOP
+// ============================================================
+
+void loop() {
+  leseSensoren();
+  pruefeMuenzeinwurf();
+  aktualisiereZustand();
+  aktualisiereLEDs();
+  aktualisiereBuzzer();
+  aktualisiereDisplay();
+  aktualisiereWiFiSymbol();
+  zeigeStatus();
+  
+  // Webserver
+  if (wifiVerbunden) {
+    server.handleClient();
+  }
+  
+  // WiFi Retry im Hintergrund
+  wifiRetry();
+  
+  delay(50);
+}
